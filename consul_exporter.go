@@ -98,6 +98,16 @@ var (
 		"The values for selected keys in Consul's key/value catalog. Keys with non-numeric values are omitted.",
 		[]string{"key"}, nil,
 	)
+	serviceAppChecks = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "health_service_app_status"),
+		"Status of health checks associated with a service.",
+		[]string{"check", "node", "service_id", "service_name", "status", "env_id", "app"}, nil,
+	)
+	nodeAppChecks = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "health_node_app_status"),
+		"Status of health checks associated with a node.",
+		[]string{"check", "node", "status", "env_id", "app"}, nil,
+	)
 	queryOptions = consul_api.QueryOptions{}
 )
 
@@ -112,11 +122,12 @@ func (l promHTTPLogger) Println(v ...interface{}) {
 // Exporter collects Consul stats from the given server and exports them using
 // the prometheus metrics package.
 type Exporter struct {
-	client        *consul_api.Client
-	kvPrefix      string
-	kvFilter      *regexp.Regexp
-	healthSummary bool
-	logger        log.Logger
+	client         *consul_api.Client
+	kvPrefix       string
+	kvFilter       *regexp.Regexp
+	healthSummary  bool
+	logger         log.Logger
+	onceSelfHealth map[string]bool
 }
 
 type consulOpts struct {
@@ -172,11 +183,12 @@ func NewExporter(opts consulOpts, kvPrefix, kvFilter string, healthSummary bool,
 
 	// Init our exporter.
 	return &Exporter{
-		client:        client,
-		kvPrefix:      kvPrefix,
-		kvFilter:      regexp.MustCompile(kvFilter),
-		healthSummary: healthSummary,
-		logger:        logger,
+		client:         client,
+		kvPrefix:       kvPrefix,
+		kvFilter:       regexp.MustCompile(kvFilter),
+		healthSummary:  healthSummary,
+		logger:         logger,
+		onceSelfHealth: make(map[string]bool),
 	}, nil
 }
 
@@ -194,11 +206,14 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- serviceChecks
 	ch <- keyValues
 	ch <- serviceTag
+	ch <- serviceAppChecks
+	ch <- nodeAppChecks
 }
 
 // Collect fetches the stats from configured Consul location and delivers them
 // as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+	e.onceSelfHealth = make(map[string]bool)
 	ok := e.collectPeersMetric(ch)
 	ok = e.collectLeaderMetric(ch) && ok
 	ok = e.collectNodesMetric(ch) && ok
@@ -380,16 +395,59 @@ func (e *Exporter) collectOneHealthSummary(ch chan<- prometheus.Metric, serviceN
 		// We have a Node, a Service, and one or more Checks. Our
 		// service-node combo is passing if all checks have a `status`
 		// of "passing."
-		passing := 1.
+		passingStatus := 1.
 		for _, hc := range entry.Checks {
-			if hc.Status != consul_api.HealthPassing {
-				passing = 0
-				break
+			var passing, warning, critical, maintenance float64
+
+			switch hc.Status {
+			case consul_api.HealthPassing:
+				passing = 1
+			case consul_api.HealthWarning:
+				passingStatus = 0
+				warning = 1
+			case consul_api.HealthCritical:
+				passingStatus = 0
+				critical = 1
+			case consul_api.HealthMaint:
+				passingStatus = 0
+				maintenance = 1
+			}
+
+			if hc.ServiceID == "" {
+				if !e.onceSelfHealth[hc.Node] {
+					ch <- prometheus.MustNewConstMetric(
+						nodeAppChecks, prometheus.GaugeValue, passing, hc.CheckID, hc.Node, consul_api.HealthPassing, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+					)
+					ch <- prometheus.MustNewConstMetric(
+						nodeAppChecks, prometheus.GaugeValue, warning, hc.CheckID, hc.Node, consul_api.HealthWarning, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+					)
+					ch <- prometheus.MustNewConstMetric(
+						nodeAppChecks, prometheus.GaugeValue, critical, hc.CheckID, hc.Node, consul_api.HealthCritical, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+					)
+					ch <- prometheus.MustNewConstMetric(
+						nodeAppChecks, prometheus.GaugeValue, maintenance, hc.CheckID, hc.Node, consul_api.HealthMaint, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+					)
+					e.onceSelfHealth[hc.Node] = true
+				}
+			} else {
+				ch <- prometheus.MustNewConstMetric(
+					serviceAppChecks, prometheus.GaugeValue, passing, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul_api.HealthPassing, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+				)
+				ch <- prometheus.MustNewConstMetric(
+					serviceAppChecks, prometheus.GaugeValue, warning, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul_api.HealthWarning, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+				)
+				ch <- prometheus.MustNewConstMetric(
+					serviceAppChecks, prometheus.GaugeValue, critical, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul_api.HealthCritical, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+				)
+				ch <- prometheus.MustNewConstMetric(
+					serviceAppChecks, prometheus.GaugeValue, maintenance, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul_api.HealthMaint, entry.Node.Meta["env_id"], entry.Node.Meta["app"],
+				)
 			}
 		}
 		ch <- prometheus.MustNewConstMetric(
-			serviceNodesHealthy, prometheus.GaugeValue, passing, entry.Service.ID, entry.Node.Node, entry.Service.Service,
+			serviceNodesHealthy, prometheus.GaugeValue, passingStatus, entry.Service.ID, entry.Node.Node, entry.Service.Service,
 		)
+
 		tags := make(map[string]struct{})
 		for _, tag := range entry.Service.Tags {
 			if _, ok := tags[tag]; ok {
